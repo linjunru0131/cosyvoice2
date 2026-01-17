@@ -13,6 +13,16 @@
 # limitations under the License.
 
 from __future__ import print_function
+import os
+import sys
+
+
+PROJECT_ROOT = "D:\\CosyVoice2"
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+
 import argparse
 import datetime
 import logging
@@ -48,7 +58,7 @@ def get_args():
     parser.add_argument('--config', required=True, help='config file')
     parser.add_argument('--train_data', required=True, help='train data file')
     parser.add_argument('--cv_data', required=True, help='cv data file')
-    parser.add_argument('--qwen_pretrain_path', required=False, help='qwen pretrain path')
+    parser.add_argument('--qwen_pretrain_path', required=True, help='qwen pretrain path')
     parser.add_argument('--checkpoint', help='checkpoint model')
     parser.add_argument('--model_dir', required=True, help='save model dir')
     parser.add_argument('--tensorboard_dir',
@@ -181,14 +191,24 @@ def main():
     for epoch in range(start_epoch + 1, info_dict['max_epoch']):
         executor.epoch = epoch
         train_dataset.set_epoch(epoch)
-        dist.barrier()
-        group_join = dist.new_group(backend="gloo", timeout=datetime.timedelta(seconds=args.timeout))
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        group_join = None
+        if dist.is_available() and dist.is_initialized():
+            group_join = dist.new_group(
+                backend="gloo",
+                timeout=datetime.timedelta(seconds=args.timeout)
+            )
         if gan is True:
             executor.train_one_epoc_gan(model, optimizer, scheduler, optimizer_d, scheduler_d, train_data_loader, cv_data_loader,
                                         writer, info_dict, scaler, group_join)
         else:
             executor.train_one_epoc(model, optimizer, scheduler, train_data_loader, cv_data_loader, writer, info_dict, scaler, group_join, ref_model=ref_model)
-        dist.destroy_process_group(group_join)
+        #dist.destroy_process_group(group_join)
+        try:
+            dist.destroy_process_group(group_join)
+        except (AssertionError, ValueError):
+            pass
 
 
 if __name__ == '__main__':

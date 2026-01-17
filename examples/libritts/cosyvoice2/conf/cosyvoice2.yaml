@@ -1,3 +1,5 @@
+train_data_list: "/home/student/work/linjunru/CosyVoice2/my_biaobei_dataset/train.data.list"
+dev_data_list: "/home/student/work/linjunru/CosyVoice2/my_biaobei_dataset/dev.data.list"
 # set random seed, so that you may reproduce your result.
 __set_seed1: !apply:random.seed [1986]
 __set_seed2: !apply:numpy.random.seed [1986]
@@ -9,7 +11,7 @@ sample_rate: 24000
 llm_input_size: 896
 llm_output_size: 896
 spk_embed_dim: 192
-qwen_pretrain_path: ''
+qwen_pretrain_path:  /home/student/work/linjunru/CosyVoice2/pretrained_models/Qwen2-0.5B
 token_frame_rate: 25
 token_mel_ratio: 2
 
@@ -170,9 +172,11 @@ sort: !name:cosyvoice.dataset.processor.sort
     sort_size: 500  # sort_size should be less than shuffle_size
 batch: !name:cosyvoice.dataset.processor.batch
     batch_type: 'dynamic'
-    max_frames_in_batch: 2000
+    #max_frames_in_batch: 2000
+    max_frames_in_batch: 3000
 padding: !name:cosyvoice.dataset.processor.padding
-    use_spk_embedding: False # change to True during sft
+    #use_spk_embedding: False # change to True during sft
+    use_spk_embedding: True
 
 
 # dataset processor pipeline
@@ -211,11 +215,15 @@ train_conf:
     scheduler: constantlr # change to constantlr during sft
     scheduler_conf:
         warmup_steps: 2500
-    max_epoch: 200
+    max_epoch: 150
     grad_clip: 5
-    accum_grad: 2
-    log_interval: 100
+    #accum_grad: 2
+    accum_grad: 1
+    log_interval: 50
     save_per_step: -1
+    save_per_epoch: 15
+    save_epoch_interval: 15
+    fp16: True
 
 # gan train conf
 train_conf_gan:

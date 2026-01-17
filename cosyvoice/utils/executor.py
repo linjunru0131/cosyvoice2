@@ -48,7 +48,16 @@ class Executor:
         model.train()
         if self.ref_model is not None:
             self.ref_model.eval()
-        model_context = model.join if info_dict['train_engine'] == 'torch_ddp' else nullcontext
+        if (
+                info_dict['train_engine'] == 'torch_ddp'
+                and dist.is_available()
+                and dist.is_initialized()
+                and hasattr(model, "join")
+        ):
+            model_context = model.join
+        else:
+            model_context = nullcontext
+
         with model_context():
             for batch_idx, batch_dict in enumerate(train_data_loader):
                 info_dict["tag"] = "TRAIN"

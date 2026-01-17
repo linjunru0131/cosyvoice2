@@ -22,7 +22,7 @@ import re
 import datetime
 import yaml
 
-import deepspeed
+#import deepspeed
 import torch.optim as optim
 import torch.distributed as dist
 
@@ -30,24 +30,40 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 
-from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
+#from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
 
 from cosyvoice.dataset.dataset import Dataset
 from cosyvoice.utils.scheduler import WarmupLR, NoamHoldAnnealing, ConstantLR
 
 
 def init_distributed(args):
+    # ===== 基本信息 =====
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     rank = int(os.environ.get('RANK', 0))
-    logging.info('training on multiple gpus, this gpu {}'.format(local_rank) +
-                 ', rank {}, world_size {}'.format(rank, world_size))
+
+    logging.info(
+        f'training setup: local_rank={local_rank}, rank={rank}, world_size={world_size}'
+    )
+
+    # ===== 单卡 / Windows：直接跳过分布式 =====
+    if world_size == 1:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+            logging.info("Single GPU detected, skip distributed initialization.")
+        else:
+            logging.info("CPU training, skip distributed initialization.")
+        return world_size, 0, 0
+
+    # ===== 多卡（仅 Linux + torchrun 才适合）=====
     if args.train_engine == 'torch_ddp':
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(args.dist_backend)
+        dist.init_process_group(backend=args.dist_backend)
     else:
         deepspeed.init_distributed(dist_backend=args.dist_backend)
+
     return world_size, local_rank, rank
+
 
 
 def init_dataset_and_dataloader(args, configs, gan, dpo):
@@ -56,16 +72,24 @@ def init_dataset_and_dataloader(args, configs, gan, dpo):
     cv_dataset = Dataset(args.cv_data, data_pipeline=data_pipeline, mode='dev', gan=gan, dpo=dpo, shuffle=False, partition=False)
 
     # do not use persistent_workers=True, as whisper tokenizer opens tiktoken file each time when the for loop starts
-    train_data_loader = DataLoader(train_dataset,
-                                   batch_size=None,
-                                   pin_memory=args.pin_memory,
-                                   num_workers=args.num_workers,
-                                   prefetch_factor=args.prefetch)
-    cv_data_loader = DataLoader(cv_dataset,
-                                batch_size=None,
-                                pin_memory=args.pin_memory,
-                                num_workers=args.num_workers,
-                                prefetch_factor=args.prefetch)
+    # Windows / 单卡安全处理
+    prefetch_factor = args.prefetch if args.num_workers > 0 else None
+    pin_memory = args.pin_memory if args.num_workers > 0 else False
+
+    train_data_loader = DataLoader(
+        train_dataset,
+        batch_size=None,
+        pin_memory=pin_memory,
+        num_workers=args.num_workers,
+        prefetch_factor=prefetch_factor
+    )
+    cv_data_loader = DataLoader(
+        cv_dataset,
+        batch_size=None,
+        pin_memory=pin_memory,
+        num_workers=args.num_workers,
+        prefetch_factor=prefetch_factor
+    )
     return train_dataset, cv_dataset, train_data_loader, cv_data_loader
 
 
@@ -92,21 +116,16 @@ def check_modify_and_save_config(args, configs):
 
 
 def wrap_cuda_model(args, model):
-    local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', 1))
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    if args.train_engine == "torch_ddp":  # native pytorch ddp
-        assert (torch.cuda.is_available())
-        model.cuda()
-        model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
-    else:
-        if int(os.environ.get('RANK', 0)) == 0:
-            logging.info("Estimating model states memory needs (zero2)...")
-            estimate_zero2_model_states_mem_needs_all_live(
-                model,
-                num_gpus_per_node=local_world_size,
-                num_nodes=world_size // local_world_size)
-    return model
+    import torch
+    import logging
 
+    # 单 GPU / Windows：不使用 DDP、不使用 DeepSpeed
+    logging.info("Using single GPU, no distributed training")
+
+    assert torch.cuda.is_available(), "CUDA is not available"
+    model = model.cuda()
+
+    return model
 
 def init_optimizer_and_scheduler(args, configs, model, gan):
     if gan is False:
@@ -195,23 +214,28 @@ def init_summarywriter(args):
 def save_model(model, model_name, info_dict):
     rank = int(os.environ.get('RANK', 0))
     model_dir = info_dict["model_dir"]
-    save_model_path = os.path.join(model_dir, '{}.pt'.format(model_name))
+    save_model_path = os.path.join(model_dir, f'{model_name}.pt')
 
-    if info_dict["train_engine"] == "torch_ddp":
-        if rank == 0:
-            torch.save({**model.module.state_dict(), 'epoch': info_dict['epoch'], 'step': info_dict['step']}, save_model_path)
-    else:
-        with torch.no_grad():
-            model.save_checkpoint(save_dir=model_dir,
-                                  tag=model_name,
-                                  client_state=info_dict)
+    # ===== 统一处理：兼容 单卡 / DDP =====
     if rank == 0:
+        with torch.no_grad():
+            state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+            torch.save(
+                {
+                    **state_dict,
+                    'epoch': info_dict['epoch'],
+                    'step': info_dict['step']
+                },
+                save_model_path
+            )
+
+        # 保存训练信息
         info_path = re.sub('.pt$', '.yaml', save_model_path)
         info_dict['save_time'] = datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')
         with open(info_path, 'w') as fout:
-            data = yaml.dump(info_dict)
-            fout.write(data)
-        logging.info('[Rank {}] Checkpoint: save to checkpoint {}'.format(rank, save_model_path))
+            yaml.dump(info_dict, fout)
+
+        logging.info(f'[Rank {rank}] Checkpoint saved to {save_model_path}')
 
 
 def cosyvoice_join(group_join, info_dict):
